@@ -282,15 +282,23 @@ fi
 
 # Check for Copy Fail (CVE-2026-31431)
 echo -e "\n${YELLOW}[+] ${NC}Checking for Copy Fail (CVE-2026-31431) [kernel 4.14 - 6.18.21]:"
-AEAD=$(grep -c authencesn /proc/crypto 2>/dev/null)
-SUID=$(find /usr/bin/su -perm -4000 2>/dev/null | wc -l)
-SPLICE=$(python3 -c "import os; os.splice; print(1)" 2>/dev/null)
-if [ "$AEAD" -gt 0 ] && [ "$SUID" -gt 0 ] && [ "$SPLICE" = "1" ]; then
-    echo -e "\033[1;31;103mVulnerable to Copy Fail - CVE-2026-31431\033[0m"
+
+vuln=0
+if (( ver1 == 4 && ver2 >= 14 )); then vuln=1; fi
+if (( ver1 == 5 )); then vuln=1; fi
+if (( ver1 == 6 && ver2 < 18 )); then vuln=1; fi
+if (( ver1 == 6 && ver2 == 18 && ver3 <= 21 )); then vuln=1; fi
+
+if (( vuln == 1 )); then
+    echo -e "\033[1;31;103mKernel $ver1.$ver2.$ver3 is in vulnerable range - CVE-2026-31431\033[0m"
     echo -e "${LMAGENTA}PoC: https://github.com/theori-io/copy-fail-CVE-2026-31431${NC}"
     echo -e "${LMAGENTA}Fix: echo 'install algif_aead /bin/false' > /etc/modprobe.d/disable-algif-aead.conf && rmmod algif_aead 2>/dev/null${NC}"
+    echo -e "${YELLOW}  [!] Also verify manually:${NC}"
+    echo -e "${YELLOW}      - AEAD module loaded: grep -c authencesn /proc/crypto${NC}"
+    echo -e "${YELLOW}      - su has SUID bit:    find /usr/bin/su -perm -4000${NC}"
+    echo -e "${YELLOW}      - splice available:   python3 -c 'import os; os.splice; print(1)'${NC}"
 else
-    echo -e "${GREEN}Not vulnerable (conditions not met)${NC}"
+    echo -e "${GREEN}Not vulnerable (kernel $ver1.$ver2.$ver3 outside range 4.14 - 6.18.21)${NC}"
 fi
 
 echo -e "\n${YELLOW}[+] ${NC}Checking for compilers (kernel exploit compilation):"
