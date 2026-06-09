@@ -62,10 +62,15 @@ echo -e "\033[1;31;103mPrivilege Escalation Vector\033[0m"
 # ============================================================================
 PASSWORD=""
 USERNAME=""
+HUNT_USERS=0
 
-# Handle --help before getopts (getopts doesn't support long options)
+# Handle long options before getopts (getopts doesn't support them).
+# Recognized long options are consumed here; any remaining args are passed
+# through to getopts below via the rebuilt "$@".
+_args=()
 for arg in "$@"; do
-    if [ "$arg" = "--help" ] || [ "$arg" = "-h" ]; then
+    case "$arg" in
+        --help|-h)
         echo -e "${LBLUE}╔═══════════════════════════════════════════════════════════╗${NC}"
         echo -e "${LBLUE}║ LinEnum-ng — Usage & Help                                 ║${NC}"
         echo -e "${LBLUE}╚═══════════════════════════════════════════════════════════╝${NC}"
@@ -80,6 +85,11 @@ for arg in "$@"; do
         echo -e "    ${CYAN}-u USERNAME${NC}    Target a specific username to hunt across the filesystem."
         echo -e "                   Searches for files named after the user and files"
         echo -e "                   containing the username in their content."
+        echo -e ""
+        echo -e "    ${CYAN}--hunt-users${NC}   Cross-reference every login-shell user from /etc/passwd"
+        echo -e "                   against config/web/app directories. Powerful, but can be"
+        echo -e "                   slow on large boxes, so it is OFF by default and only runs"
+        echo -e "                   when this flag is supplied."
         echo -e ""
         echo -e "    ${CYAN}-h, --help${NC}     Show this help message and exit."
         echo -e ""
@@ -100,9 +110,22 @@ for arg in "$@"; do
         echo -e "    ${CYAN}$0 -p 'rockyou' -u admin${NC}"
         echo -e "    ${YELLOW}    Check if 'rockyou' grants sudo rights, and search for 'admin' artifacts.${NC}"
         echo -e ""
-        exit 0
-    fi
+        echo -e "    ${CYAN}$0 --hunt-users${NC}"
+        echo -e "    ${YELLOW}    Full run plus the (slower) login-shell user cross-reference hunt.${NC}"
+        echo -e ""
+            exit 0
+            ;;
+        --hunt-users)
+            HUNT_USERS=1
+            ;;
+        *)
+            _args+=("$arg")
+            ;;
+    esac
 done
+# Rebuild positional parameters with long options stripped out, so getopts
+# only sees the short options it understands.
+set -- "${_args[@]}"
 
 while getopts ":p:u:" opt; do
     case $opt in
@@ -131,6 +154,10 @@ fi
 
 if [ -n "$USERNAME" ]; then
     echo -e "${LMAGENTA}[*] Username target: ${WHITE}$USERNAME${NC}${LMAGENTA} — will hunt files by name and content${NC}"
+fi
+
+if [ "$HUNT_USERS" = "1" ]; then
+    echo -e "${LMAGENTA}[*] --hunt-users enabled — will cross-reference login-shell users against config/web/app dirs (may be slow)${NC}"
 fi
 
 # ============================================================================
@@ -998,6 +1025,79 @@ find / \( -path /proc -o -path /sys -o -path /dev -o -path /run \) -prune -o -ty
     echo -e "${LRED}$dir${NC}"
 done
 
+# ---- Readable sensitive files (dotfiles + world-readable configs) ----
+# Grouped with the writable checks above: these are permission-based finds for
+# files the current user can READ but probably shouldn't — they frequently leak
+# credentials, keys, or history that lead straight to privilege escalation.
+echo -e "\n${YELLOW}[+] ${NC}Readable dot-config files in home directories:"
+
+dotfile_patterns=(
+    ".bash_history" ".zsh_history" ".sh_history"
+    ".bashrc" ".zshrc" ".profile"
+    ".netrc" ".pgpass" ".my.cnf" ".boto"
+    ".aws/credentials" ".aws/config"
+    ".docker/config.json"
+    ".git-credentials"
+    ".ssh/config" ".ssh/id_rsa" ".ssh/id_ecdsa" ".ssh/id_ed25519"
+    ".kube/config"
+    ".config/gcloud/credentials.db"
+    ".config/gcloud/application_default_credentials.json"
+)
+
+for homedir in /home/* /root; do
+    if [ -d "$homedir" ]; then
+        for dotfile in "${dotfile_patterns[@]}"; do
+            target="$homedir/$dotfile"
+            if [ -r "$target" ] 2>/dev/null; then
+                echo -e "${LRED}[READABLE] $target${NC}"
+                # Special loud alert for SSH keys and credential stores
+                case "$dotfile" in
+                    .ssh/id_rsa|.ssh/id_ecdsa|.ssh/id_ed25519)
+                        echo -e "\033[1;31;103m  ^^^ PRIVATE SSH KEY READABLE!\033[0m"
+                        head -3 "$target" 2>/dev/null | while read line; do
+                            echo -e "${CYAN}    $line${NC}"
+                        done
+                        ;;
+                    .netrc|.pgpass|.my.cnf|.boto|.aws/credentials|.git-credentials|.kube/config)
+                        echo -e "\033[1;31;103m  ^^^ CREDENTIAL FILE READABLE!\033[0m"
+                        grep -v "^#" "$target" 2>/dev/null | head -5 | while read line; do
+                            echo -e "${CYAN}    $line${NC}"
+                        done
+                        ;;
+                    *history)
+                        echo -e "${YELLOW}  ^^^ History file — check for passwords typed in commands:${NC}"
+                        grep -iE "pass|secret|token|curl.*-u|mysql.*-p|sshpass" "$target" 2>/dev/null | tail -5 | while read line; do
+                            echo -e "${CYAN}    $line${NC}"
+                        done
+                        ;;
+                esac
+            fi
+        done
+    fi
+done
+
+echo -e "\n${YELLOW}[+] ${NC}World-readable config/env files in non-standard paths (first 20):"
+world_readable=$(find / \( -path /proc -o -path /sys -o -path /dev -o -path /tmp \) -prune -o \
+    \( -name "*.conf" -o -name "*.env" -o -name ".env" -o -name "*.cfg" -o -name "*.ini" \
+    -o -name "*.php" -o -name ".htaccess" \) \
+    -perm -o+r -not -path "/etc/*" -not -path "/usr/share/*" -not -path "/usr/lib/*" \
+    -type f -print 2>/dev/null | head -20)
+
+if [ -n "$world_readable" ]; then
+    echo "$world_readable" | while read f; do
+        echo -e "${LRED}$f${NC}"
+        cred_hit=$(grep -iE "password|passwd|secret|token|api.?key|AuthUserFile|DB_PASS|DB_USER|db_password|username|user=" "$f" 2>/dev/null | grep -v "^#" | head -2)
+        if [ -n "$cred_hit" ]; then
+            echo -e "\033[1;31;103m  ^^^ Contains credential-like strings!\033[0m"
+            echo "$cred_hit" | while read line; do
+                echo -e "${CYAN}    $line${NC}"
+            done
+        fi
+    done
+else
+    echo -e "${GREEN}No notable world-readable config files found${NC}"
+fi
+
 # ============================================================================
 # INTERESTING FILES
 # ============================================================================
@@ -1578,162 +1678,63 @@ if [ $found_sensitive -eq 0 ]; then
     echo -e "${GREEN}No known sensitive config files readable${NC}"
 fi
 
-# ---- Config files readable in common app dirs ----
-echo -e "\n${YELLOW}[+] ${NC}Readable config files in common application directories:"
 
-app_dirs=(
-    "/opt"
-    "/srv"
-    "/var/www"
-    "/usr/local/etc"
-    "/app"
-    "/home"
-)
+# ---- Shell users cross-reference hunt (opt-in via --hunt-users) ----
+# Cross-references every login-shell user against config/web/app dirs. Useful,
+# but can be slow on large boxes, so it only runs when --hunt-users is passed.
+if [ "$HUNT_USERS" != "1" ]; then
+    echo -e "\n${YELLOW}[+] ${NC}Login-shell user cross-reference hunt: ${CYAN}skipped${NC}."
+    echo -e "${YELLOW}    Can be slow on large systems. Re-run with ${CYAN}--hunt-users${YELLOW} to enable it.${NC}"
+else
+    echo -e "\n${YELLOW}[+] ${NC}Harvesting users with a login shell from /etc/passwd:"
 
-for dir in "${app_dirs[@]}"; do
-    if [ -d "$dir" ]; then
-        readable=$(find "$dir" -maxdepth 5 \( -name "*.conf" -o -name "*.config" -o -name "*.cfg" \
-            -o -name "*.ini" -o -name "*.env" -o -name ".env" -o -name "*.yaml" -o -name "*.yml" \
-            -o -name "*.toml" -o -name "*.json" -o -name "*.properties" -o -name "*.xml" \
-            -o -name "*.php" -o -name ".htaccess" \) \
-            -readable -type f 2>/dev/null | head -20)
-        if [ -n "$readable" ]; then
-            echo -e "${CYAN}  $dir:${NC}"
-            echo "$readable" | while read f; do
-                echo -e "${LRED}    $f${NC}"
-                cred_hit=$(grep -iE "password|passwd|secret|token|api.?key|credential|AuthUserFile|DB_PASS|DB_USER|db_password|username|user=" "$f" 2>/dev/null | grep -v "^#" | head -2)
-                if [ -n "$cred_hit" ]; then
-                    echo -e "\033[1;31;103m      ^^^ Contains credential-like strings!\033[0m"
-                    echo "$cred_hit" | while read line; do
-                        echo -e "${CYAN}        $line${NC}"
-                    done
-                fi
+    shell_users=()
+    while IFS=: read -r uname _ _ _ _ _ ushell; do
+        case "$ushell" in
+            */bash|*/sh|*/zsh|*/fish|*/ksh|*/tcsh|*/csh|*/dash)
+                shell_users+=("$uname")
+                echo -e "${CYAN}  $uname ($ushell)${NC}"
+                ;;
+        esac
+    done < /etc/passwd
+
+    if [ ${#shell_users[@]} -eq 0 ]; then
+        echo -e "${GREEN}No users with login shells found${NC}"
+    else
+        echo -e "\n${YELLOW}[+] ${NC}Hunting for shell usernames in config/web/app directories: ${CYAN}(may take a moment)${NC}"
+
+        hunt_dirs=(
+            "/var/www"
+            "/srv"
+            "/opt"
+            "/app"
+            "/usr/local/etc"
+            "/etc"
+            "/tmp"
+            "/var/backups"
+            "/var/lib"
+        )
+
+        for uname in "${shell_users[@]}"; do
+            user_hits=""
+            for dir in "${hunt_dirs[@]}"; do
+                [ -d "$dir" ] || continue
+                hits=$(grep -rIl "$uname" "$dir" 2>/dev/null | grep -vE "\.log$|/proc/|/sys/" | head -10)
+                [ -n "$hits" ] && user_hits+="$hits"$'\n'
             done
-        fi
-    fi
-done
 
-# ---- Dot files in home directories ----
-echo -e "\n${YELLOW}[+] ${NC}Readable dot-config files in home directories:"
-
-dotfile_patterns=(
-    ".bash_history" ".zsh_history" ".sh_history"
-    ".bashrc" ".zshrc" ".profile"
-    ".netrc" ".pgpass" ".my.cnf" ".boto"
-    ".aws/credentials" ".aws/config"
-    ".docker/config.json"
-    ".git-credentials"
-    ".ssh/config" ".ssh/id_rsa" ".ssh/id_ecdsa" ".ssh/id_ed25519"
-    ".kube/config"
-    ".config/gcloud/credentials.db"
-    ".config/gcloud/application_default_credentials.json"
-)
-
-for homedir in /home/* /root; do
-    if [ -d "$homedir" ]; then
-        for dotfile in "${dotfile_patterns[@]}"; do
-            target="$homedir/$dotfile"
-            if [ -r "$target" ] 2>/dev/null; then
-                echo -e "${LRED}[READABLE] $target${NC}"
-                # Special loud alert for SSH keys and credential stores
-                case "$dotfile" in
-                    .ssh/id_rsa|.ssh/id_ecdsa|.ssh/id_ed25519)
-                        echo -e "\033[1;31;103m  ^^^ PRIVATE SSH KEY READABLE!\033[0m"
-                        head -3 "$target" 2>/dev/null | while read line; do
-                            echo -e "${CYAN}    $line${NC}"
-                        done
-                        ;;
-                    .netrc|.pgpass|.my.cnf|.boto|.aws/credentials|.git-credentials|.kube/config)
-                        echo -e "\033[1;31;103m  ^^^ CREDENTIAL FILE READABLE!\033[0m"
-                        grep -v "^#" "$target" 2>/dev/null | head -5 | while read line; do
-                            echo -e "${CYAN}    $line${NC}"
-                        done
-                        ;;
-                    *history)
-                        echo -e "${YELLOW}  ^^^ History file — check for passwords typed in commands:${NC}"
-                        grep -iE "pass|secret|token|curl.*-u|mysql.*-p|sshpass" "$target" 2>/dev/null | tail -5 | while read line; do
-                            echo -e "${CYAN}    $line${NC}"
-                        done
-                        ;;
-                esac
+            if [ -n "$user_hits" ]; then
+                echo -e "\n${LRED}[HIT] Username '${uname}' found in:${NC}"
+                echo "$user_hits" | sort -u | while read f; do
+                    [ -z "$f" ] && continue
+                    echo -e "${LRED}    $f${NC}"
+                    grep -n "$uname" "$f" 2>/dev/null | head -5 | while read match; do
+                        echo -e "${CYAN}      $match${NC}"
+                    done
+                done
             fi
         done
     fi
-done
-
-# ---- World-readable config files outside /tmp ----
-echo -e "\n${YELLOW}[+] ${NC}World-readable config/env files in non-standard paths (first 20):"
-world_readable=$(find / \( -path /proc -o -path /sys -o -path /dev -o -path /tmp \) -prune -o \
-    \( -name "*.conf" -o -name "*.env" -o -name ".env" -o -name "*.cfg" -o -name "*.ini" \
-    -o -name "*.php" -o -name ".htaccess" \) \
-    -perm -o+r -not -path "/etc/*" -not -path "/usr/share/*" -not -path "/usr/lib/*" \
-    -type f -print 2>/dev/null | head -20)
-
-if [ -n "$world_readable" ]; then
-    echo "$world_readable" | while read f; do
-        echo -e "${LRED}$f${NC}"
-        cred_hit=$(grep -iE "password|passwd|secret|token|api.?key|AuthUserFile|DB_PASS|DB_USER|db_password|username|user=" "$f" 2>/dev/null | grep -v "^#" | head -2)
-        if [ -n "$cred_hit" ]; then
-            echo -e "\033[1;31;103m  ^^^ Contains credential-like strings!\033[0m"
-            echo "$cred_hit" | while read line; do
-                echo -e "${CYAN}    $line${NC}"
-            done
-        fi
-    done
-else
-    echo -e "${GREEN}No notable world-readable config files found${NC}"
-fi
-
-
-# ---- Shell users cross-reference hunt ----
-echo -e "\n${YELLOW}[+] ${NC}Harvesting users with a login shell from /etc/passwd:"
-
-shell_users=()
-while IFS=: read -r uname _ _ _ _ _ ushell; do
-    case "$ushell" in
-        */bash|*/sh|*/zsh|*/fish|*/ksh|*/tcsh|*/csh|*/dash)
-            shell_users+=("$uname")
-            echo -e "${CYAN}  $uname ($ushell)${NC}"
-            ;;
-    esac
-done < /etc/passwd
-
-if [ ${#shell_users[@]} -eq 0 ]; then
-    echo -e "${GREEN}No users with login shells found${NC}"
-else
-    echo -e "\n${YELLOW}[+] ${NC}Hunting for shell usernames in config/web/app directories: ${CYAN}(may take a moment)${NC}"
-
-    hunt_dirs=(
-        "/var/www"
-        "/srv"
-        "/opt"
-        "/app"
-        "/usr/local/etc"
-        "/etc"
-        "/tmp"
-        "/var/backups"
-        "/var/lib"
-    )
-
-    for uname in "${shell_users[@]}"; do
-        user_hits=""
-        for dir in "${hunt_dirs[@]}"; do
-            [ -d "$dir" ] || continue
-            hits=$(grep -rIl "$uname" "$dir" 2>/dev/null | grep -vE "\.log$|/proc/|/sys/" | head -10)
-            [ -n "$hits" ] && user_hits+="$hits"$'\n'
-        done
-
-        if [ -n "$user_hits" ]; then
-            echo -e "\n${LRED}[HIT] Username '${uname}' found in:${NC}"
-            echo "$user_hits" | sort -u | while read f; do
-                [ -z "$f" ] && continue
-                echo -e "${LRED}    $f${NC}"
-                grep -n "$uname" "$f" 2>/dev/null | head -5 | while read match; do
-                    echo -e "${CYAN}      $match${NC}"
-                done
-            done
-        fi
-    done
 fi
 
 echo -e "\n${LMAGENTA}[!] USEFUL FOLLOW-UP COMMANDS:${NC}"
@@ -1775,6 +1776,10 @@ fi
 
 if [ -z "$USERNAME" ]; then
     echo -e "\n${YELLOW}[*] Tip: re-run with -u <username> to hunt all files related to a specific user.${NC}"
+fi
+
+if [ "$HUNT_USERS" != "1" ]; then
+    echo -e "\n${YELLOW}[*] Tip: re-run with --hunt-users to cross-reference login-shell users against config/web/app dirs (slower, but turns up cred reuse).${NC}"
 fi
 
 echo -e "\n${YELLOW}Scan completed at:${NC}"; date
